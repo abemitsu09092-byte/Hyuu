@@ -62,14 +62,40 @@ python3 extract_sheets.py "https://www.youtube.com/watch?v=2eRFYo5QAPE" \
 python3 extract_sheets.py ./recital.mp4 --output sheets.pdf
 ```
 
-### 重要: このコンテナ環境ではYouTubeに接続できません
+### JavaScriptランタイムについて
 
-このリポジトリのCI/開発コンテナ環境は組織のegressポリシーにより
-`www.youtube.com` への通信がブロックされています（`yt-dlp` によるダウンロード
-が失敗します）。**YouTube URLを指定して実行する場合は、インターネット
-（YouTube）に到達できる別のマシン上でこのツールを実行してください。**
+現在の `yt-dlp` は YouTube のプレイヤーチャレンジをJavaScriptで解くため、
+`deno` / `node` / `bun` のいずれかを必要とします（無いとフォーマットが
+欠落します）。本ツールはPATH上から自動検出して `yt-dlp` に渡すので、
+通常は何もしなくて構いません。明示したい場合は `--js-runtimes` を使います。
+
+```bash
+--js-runtimes node:/opt/node22/bin/node
+```
+
+注意: `node` は **22以上** が必要です。20系は `unsupported` として無視されます。
+
+
+### 重要: このコンテナ環境からはYouTube動画をダウンロードできません
+
+`www.youtube.com` への通信自体は到達しますが、共有データセンターIPからの
+アクセスであるため YouTube 側の bot 判定に阻まれ、動画ストリームが取得
+できません（`HTTP 429` および `Sign in to confirm you're not a bot` /
+`LOGIN_REQUIRED`）。全プレイヤークライアント（tv / android / ios / web系）、
+PO Token プロバイダ（bgutil）を用意しても結果は同じです。
+
+**YouTube URLを指定して実行する場合は、普段YouTubeを見ているマシン上で、
+ログイン済みブラウザのcookieを渡して実行してください。**
+
+```bash
+python3 extract_sheets.py "https://www.youtube.com/watch?v=..." \
+  --cookies-from-browser chrome \
+  --output sheets.pdf
+```
+
 ローカル動画ファイルに対する処理（フレーム抽出以降のパイプライン全体）は、
-このコンテナ内でも問題なく動作します。
+このコンテナ内でも問題なく動作します。手元でダウンロードした動画ファイルを
+渡す運用でも構いません。
 
 
 ## 処理の流れ（パイプライン）
@@ -108,6 +134,10 @@ python3 extract_sheets.py ./recital.mp4 --output sheets.pdf
 | `--workdir` | `./work` | 中間ファイル（動画・フレーム・ページ画像・レポート）の作業ディレクトリ |
 | `--output` | `sheets.pdf` | 出力PDFのパス |
 | `--max-height` | `1080` | ダウンロード時の高さ上限（yt-dlpのフォーマット選択に使用） |
+| `--cookies` | `None` | Netscape形式のcookieファイル。YouTubeがログイン/bot確認を要求する場合に必要 |
+| `--cookies-from-browser` | `None` | ローカルのブラウザから直接cookieを取得（`chrome` / `firefox` / `edge` / `safari` など。書式は `BROWSER[+KEYRING][:PROFILE][::CONTAINER]`） |
+| `--js-runtimes` | (自動検出) | yt-dlpが使うJSランタイム `RUNTIME[:PATH]`。省略時はPATH上の deno / node / bun を自動検出 |
+| `--ytdlp-arg` | `[]` | yt-dlpへ生のオプションを転送（トークンごとに繰り返す。例: `--ytdlp-arg --extractor-args --ytdlp-arg youtube:player_client=tv`） |
 | `--force` | `False` | キャッシュされた中間ファイルを無視してすべてやり直す |
 | `--fps` | `2.0` | フレームサンプリングのfps |
 | `--start` | `None` | 解析範囲の開始秒（省略時は動画の先頭から） |
@@ -195,3 +225,35 @@ python3 extract_sheets.py ./recital.mp4 --output sheets.pdf
   クロップ全体に影響します。`--crop` で先に絞り込むのが確実です。
 - ページ検出はカメラが固定（画面/譜面台を定点で映している）ことを前提
   としています。カメラが大きくパン・ズームする映像には向きません。
+
+
+## ダウンロードが失敗するとき
+
+### `Sign in to confirm you're not a bot` / `LOGIN_REQUIRED` で止まる
+
+YouTubeがそのIPをbotとみなしています。データセンター/VPN/共有IPで頻発します。
+ログイン済みブラウザのあるマシンで `--cookies-from-browser chrome` を付けて
+実行するのが最も確実です。cookieファイルを使う場合は `--cookies cookies.txt`。
+
+年齢制限やメンバー限定動画の場合も同じ対処になります。
+
+### `HTTP Error 429: Too Many Requests`
+
+同じIPからのアクセスが多すぎます。時間を空けるか、別の回線から実行してください。
+
+### フォーマットが取れない / 一部フォーマットが欠落する
+
+JSランタイムが無いか、バージョンが古い可能性があります。`node` は22以上が必要
+です。`--js-runtimes node:/path/to/node` で明示してください。
+
+### それでも駄目なとき
+
+`--ytdlp-arg` で任意のyt-dlpオプションを転送できます。プレイヤークライアントを
+切り替えたい場合は次のように指定します。
+
+```bash
+--ytdlp-arg --extractor-args --ytdlp-arg youtube:player_client=tv
+```
+
+最終手段として、手元で動画をダウンロードし、ローカルファイルパスを渡してくだ
+さい（そちらの経路は完全に同じ処理を行います）。

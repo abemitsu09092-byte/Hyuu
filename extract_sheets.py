@@ -57,6 +57,12 @@ def find_ffmpeg() -> str:
         ) from exc
 
 
+def _looks_like_bot_wall(exc: BaseException) -> bool:
+    """True when a yt-dlp failure is YouTube's sign-in / bot-check refusal."""
+    msg = str(exc).lower()
+    return "not a bot" in msg or "sign in" in msg or "login_required" in msg
+
+
 def is_url(text: str) -> bool:
     try:
         parsed = urlparse(text)
@@ -182,6 +188,23 @@ class Page:
 # --------------------------------------------------------------------------
 
 
+def detect_js_runtime() -> Optional[str]:
+    """Pick a JavaScript runtime for yt-dlp from whatever is on PATH.
+
+    Recent yt-dlp versions solve YouTube's player challenge in JS and warn that
+    extraction without a runtime is deprecated; only deno is enabled by default,
+    so a machine with just node installed silently loses formats.
+    """
+    for name in ("deno", "node", "bun"):
+        path = shutil.which(name)
+        if path:
+            # Hand over the resolved path, not just the name: yt-dlp does its own
+            # lookup and can land on a different (often older, unsupported) copy
+            # than the one first on PATH.
+            return f"{name}:{path}"
+    return None
+
+
 def stage1_acquire(
     input_arg: str,
     workdir: Path,
@@ -190,6 +213,9 @@ def stage1_acquire(
     ffmpeg_bin: str,
     verbose: bool,
     cookies: Optional[str] = None,
+    cookies_from_browser: Optional[str] = None,
+    js_runtimes: Optional[str] = None,
+    ytdlp_args: Optional[List[str]] = None,
 ) -> Path:
     if not is_url(input_arg):
         local = Path(input_arg).expanduser().resolve()
@@ -222,7 +248,28 @@ def stage1_acquire(
         f"best[height<={max_height}][ext=mp4]/"
         f"best[height<={max_height}]/best"
     )
-    ydl_opts = {
+    # Anything the caller wants to hand straight to yt-dlp is parsed by yt-dlp
+    # itself rather than hand-mapped here, so option shapes stay correct as
+    # yt-dlp evolves. Our own settings are layered on top.
+    passthrough: List[str] = []
+    if cookies_from_browser:
+        passthrough += ["--cookies-from-browser", cookies_from_browser]
+    runtime = js_runtimes if js_runtimes is not None else detect_js_runtime()
+    if runtime:
+        passthrough += ["--js-runtimes", runtime]
+    passthrough += list(ytdlp_args or [])
+
+    ydl_opts = {}
+    if passthrough:
+        LOG.info("extra yt-dlp options: %s", " ".join(passthrough))
+        try:
+            ydl_opts.update(yt_dlp.parse_options(passthrough + [input_arg]).ydl_opts)
+        except SystemExit as exc:  # optparse exits instead of raising
+            raise RuntimeError(
+                f"yt-dlp rejected the passthrough options: {' '.join(passthrough)}"
+            ) from exc
+
+    ydl_opts.update({
         "format": fmt,
         "outtmpl": str(workdir / "source.%(ext)s"),
         "quiet": not verbose,
@@ -233,11 +280,28 @@ def stage1_acquire(
         "ffmpeg_location": ffmpeg_bin,
         "retries": 3,
         "noplaylist": True,
-    }
+        # yt-dlp's *CLI* default is ignoreerrors='only_download', which turns a
+        # failed download into a return code instead of an exception. Passthrough
+        # options are parsed through that CLI layer, so pin this back to False or
+        # a refusal would surface later as a confusing "no source.* file" error.
+        "ignoreerrors": False,
+    })
     if cookies:
         ydl_opts["cookiefile"] = str(Path(cookies).expanduser())
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([input_arg])
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([input_arg])
+    except yt_dlp.utils.DownloadError as exc:
+        if not (cookies or cookies_from_browser) and _looks_like_bot_wall(exc):
+            raise RuntimeError(
+                "YouTube refused to serve the video streams and asked to confirm "
+                "you are not a bot. This happens on datacenter/shared IPs and on "
+                "age- or sign-in-restricted videos. Re-run from a machine with a "
+                "signed-in browser and add --cookies-from-browser chrome (or "
+                "firefox/edge/safari), or export a Netscape cookie file and pass "
+                "--cookies cookies.txt."
+            ) from exc
+        raise
 
     downloaded = sorted(workdir.glob("source.*"))
     downloaded = [p for p in downloaded if p.suffix.lower() not in (".part", ".ytdl")]
@@ -747,6 +811,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Netscape-format cookie file passed to yt-dlp; needed when YouTube "
              "demands sign-in or a bot check for the video",
     )
+    p.add_argument(
+        "--cookies-from-browser",
+        default=None,
+        metavar="BROWSER[+KEYRING][:PROFILE][::CONTAINER]",
+        help="take cookies straight from a locally installed browser (chrome, "
+             "firefox, edge, safari, ...) instead of a cookie file",
+    )
+    p.add_argument(
+        "--js-runtimes",
+        default=None,
+        metavar="RUNTIME[:PATH]",
+        help="JavaScript runtime yt-dlp may use for YouTube's player challenge; "
+             "defaults to the first of deno/node/bun found on PATH",
+    )
+    p.add_argument(
+        "--ytdlp-arg",
+        dest="ytdlp_args",
+        action="append",
+        default=[],
+        metavar="ARG",
+        help="raw extra argument forwarded to yt-dlp; repeat per token, e.g. "
+             "--ytdlp-arg --extractor-args --ytdlp-arg youtube:player_client=tv",
+    )
     p.add_argument("--force", action="store_true", help="ignore cached intermediates and redo everything")
 
     p.add_argument("--fps", type=float, default=2.0, help="frame sampling rate")
@@ -810,6 +897,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             ffmpeg_bin,
             args.verbose,
             cookies=args.cookies,
+            cookies_from_browser=args.cookies_from_browser,
+            js_runtimes=args.js_runtimes,
+            ytdlp_args=args.ytdlp_args,
         )
         frames_dir = workdir / "frames"
         frames = stage2_sample_frames(
