@@ -1,0 +1,15 @@
+# 中間生成物（動画・フレーム画像・抽出ページ）
+work/
+*.mp4
+*.mkv
+*.webm
+*.part
+
+# 出力 PDF
+*.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
