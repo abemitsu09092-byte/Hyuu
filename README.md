@@ -31,7 +31,7 @@ pip install -r requirements.txt
 
 ### ffmpeg について
 
-このツールはフレーム抽出・動画マージに `ffmpeg` を使います。
+このツールはフレーム抽出に `ffmpeg` を使います。
 
 1. まずPATH上の `ffmpeg` を探します（`which ffmpeg` で見つかるもの）。
 2. 見つからない場合は `imageio_ffmpeg` が同梱しているffmpeg実行体を自動的に使います
@@ -74,8 +74,9 @@ python3 extract_sheets.py ./recital.mp4 --output sheets.pdf
 
 ## 処理の流れ（パイプライン）
 
-1. **取得 (acquire)**: URLなら `yt-dlp` でダウンロード（高さ上限 `--max-height`、
-   mp4にマージ）。ローカルパスならそのまま使用。
+1. **取得 (acquire)**: URLなら `yt-dlp` でダウンロード（高さ上限 `--max-height`）。
+   音声は使わないので映像のみのストリームを優先し、マージ処理を回避します。
+   ローカルパスならそのまま使用。
 2. **フレーム抽出 (sample frames)**: `ffmpeg` で `--fps` 枚/秒の静止画を書き出し。
 3. **特徴量計算**: 各フレームを縮小しグレースケール化。
    - **インクマスク**: 大津の二値化で暗い（=楽譜の墨）画素を抽出（`--invert`
@@ -108,6 +109,7 @@ python3 extract_sheets.py ./recital.mp4 --output sheets.pdf
 | `--workdir` | `./work` | 中間ファイル（動画・フレーム・ページ画像・レポート）の作業ディレクトリ |
 | `--output` | `sheets.pdf` | 出力PDFのパス |
 | `--max-height` | `1080` | ダウンロード時の高さ上限（yt-dlpのフォーマット選択に使用） |
+| `--cookies` | なし | yt-dlpに渡すNetscape形式のcookieファイル。YouTubeにログインやbotチェックを求められた場合に指定 |
 | `--force` | `False` | キャッシュされた中間ファイルを無視してすべてやり直す |
 | `--fps` | `2.0` | フレームサンプリングのfps |
 | `--start` | `None` | 解析範囲の開始秒（省略時は動画の先頭から） |
