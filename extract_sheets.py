@@ -624,7 +624,33 @@ def hamming(a: np.ndarray, b: np.ndarray) -> int:
     return int(np.count_nonzero(a != b))
 
 
-def stage6_dedupe(pages: List[Page], hash_threshold: int, iou_threshold: float, invert: bool) -> List[Page]:
+def stage6_dedupe(
+    pages: List[Page],
+    hash_threshold: int,
+    iou_threshold: float,
+    invert: bool,
+    mode: str = "all",
+) -> List[Page]:
+    """Drop repeated pages, in temporal (first-appearance) order.
+
+    `mode` decides what "repeated" means, and the right answer depends on what
+    the PDF is for:
+
+    "all"      - a page matching *any* earlier page is dropped. Gives the score
+                 as a reference document: every distinct page exactly once.
+    "adjacent" - only a page matching the one immediately before it is dropped.
+                 A section played twice stays in the PDF twice, so the pages run
+                 in playing order and can be followed straight through, while a
+                 single page that segmentation split into several runs still
+                 collapses back to one.
+    "none"     - keep every candidate page.
+    """
+    if mode == "none":
+        for i, p in enumerate(pages, start=1):
+            p.page_no = i
+        LOG.info("dedupe disabled: keeping all %d pages", len(pages))
+        return list(pages)
+
     # pages are already in temporal (first-appearance) order
     small_size = (256, 256)
     for p in pages:
@@ -636,7 +662,8 @@ def stage6_dedupe(pages: List[Page], hash_threshold: int, iou_threshold: float, 
     kept: List[Page] = []
     for p in pages:
         dup_target: Optional[Page] = None
-        for k in kept:
+        candidates = kept[-1:] if mode == "adjacent" else kept
+        for k in candidates:
             hd = hamming(p.dhash, k.dhash)
             if hd > hash_threshold:
                 continue
@@ -929,6 +956,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--hash-threshold", type=int, default=6, help="max dHash hamming distance to consider pages duplicates")
     p.add_argument("--iou-threshold", type=float, default=0.85, help="min ink-mask IoU to consider pages duplicates")
+    p.add_argument("--dedupe", choices=["all", "adjacent", "none"], default="all", help="'all' keeps each distinct page once; 'adjacent' collapses only consecutive repeats, so a repeated section stays in playing order; 'none' keeps every page")
 
     p.add_argument("--margin", type=int, default=12, help="padding in px added around the auto-crop bounding box")
     p.add_argument("--no-autocrop", dest="autocrop", action="store_false", help="disable automatic crop to the union of ink across pages")
@@ -997,7 +1025,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             LOG.error("no candidate pages were produced; try lowering --staff-threshold or --min-page-seconds")
             return 1
 
-        kept_pages = stage6_dedupe(pages, args.hash_threshold, args.iou_threshold, args.invert)
+        kept_pages = stage6_dedupe(pages, args.hash_threshold, args.iou_threshold, args.invert, args.dedupe)
         if not kept_pages:
             LOG.error("all candidate pages were dropped by dedupe; check --hash-threshold/--iou-threshold")
             return 1
