@@ -33,6 +33,7 @@ LOG = logging.getLogger("extract_sheets")
 # --------------------------------------------------------------------------
 
 FEATURE_LONG_SIDE = 1000  # downscaled long side used for feature computation
+PAGE_SIZES_MM = {"a4": (210.0, 297.0), "letter": (215.9, 279.4)}
 POPCOUNT_TABLE = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint32)
 
 
@@ -432,7 +433,11 @@ def staff_confidence(mask: np.ndarray) -> float:
     if len(clusters) < 5:
         return 0.0
 
-    min_span, max_span = 8, int(0.35 * h)
+    # A staff group may legitimately fill almost the whole frame: cropping to a
+    # score strip (one system along the bottom of a play-along video) leaves an
+    # image that *is* a single staff. Only the spread-across-everything case,
+    # where five unrelated ink spikes masquerade as staff lines, is excluded.
+    min_span, max_span = 8, max(8, int(0.9 * h))
     best = 0.0
     for i in range(len(clusters) - 4):
         window = clusters[i : i + 5]
@@ -453,11 +458,32 @@ def sharpness_score(gray: np.ndarray) -> float:
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
-def stage3_compute_features(frames: List[FrameMeta], invert: bool) -> None:
+def load_frame(
+    path: Path, crop: Optional[Tuple[float, float, float, float]]
+) -> Optional[np.ndarray]:
+    """Read a sampled frame, reduced to the region the score actually occupies.
+
+    Every stage that touches pixels goes through here, so a manual crop narrows
+    detection as well as output. That matters whenever the score is only part of
+    the picture -- a performance shot with a score strip along the bottom, say --
+    because the performer then dominates both the ink mask and its frame-to-frame
+    difference, which buries the score's own page changes in noise.
+    """
+    img = cv2.imread(str(path))
+    if img is None:
+        return None
+    return apply_manual_crop(img, crop) if crop is not None else img
+
+
+def stage3_compute_features(
+    frames: List[FrameMeta],
+    invert: bool,
+    crop: Optional[Tuple[float, float, float, float]] = None,
+) -> None:
     LOG.info("computing per-frame features for %d frames", len(frames))
     target_size: Optional[Tuple[int, int]] = None
     for i, fm in enumerate(frames):
-        img = cv2.imread(str(fm.path))
+        img = load_frame(fm.path, crop)
         if img is None:
             LOG.warning("could not read frame %s, skipping features (treated as blank)", fm.path)
             continue
@@ -526,7 +552,12 @@ def stage4_segment(
 # --------------------------------------------------------------------------
 
 
-def stage5_build_pages(runs: List[Run], median_frames: int, debug_dir: Optional[Path]) -> List[Page]:
+def stage5_build_pages(
+    runs: List[Run],
+    median_frames: int,
+    debug_dir: Optional[Path],
+    crop: Optional[Tuple[float, float, float, float]] = None,
+) -> List[Page]:
     pages: List[Page] = []
     kept_runs = [r for r in runs if r.kept]
     LOG.info("building composite images for %d pages", len(kept_runs))
@@ -547,7 +578,7 @@ def stage5_build_pages(runs: List[Run], median_frames: int, debug_dir: Optional[
         if len(usable_idxs) >= 2:
             imgs = []
             for i in usable_idxs:
-                img = cv2.imread(str(frames[i].path))
+                img = load_frame(frames[i].path, crop)
                 if img is not None:
                     imgs.append(img.astype(np.float32))
             if len(imgs) >= 2:
@@ -557,7 +588,7 @@ def stage5_build_pages(runs: List[Run], median_frames: int, debug_dir: Optional[
         if image is None:
             # fallback: single sharpest frame in the run
             best_i = int(np.argmax(sharpness_values))
-            img = cv2.imread(str(frames[best_i].path))
+            img = load_frame(frames[best_i].path, crop)
             if img is None:
                 LOG.warning("run at %.2fs produced no readable frames, skipping", run.start_ts)
                 continue
@@ -690,21 +721,48 @@ def compute_autocrop_box(pages: List[Page], invert: bool, margin: int) -> Tuple[
     return x0, y0, x1 - x0, y1 - y0
 
 
+def tile_images(
+    images: List[np.ndarray], per_sheet: int, gutter: int, invert: bool
+) -> List[np.ndarray]:
+    """Stack consecutive page images vertically, `per_sheet` to a sheet.
+
+    Scores shown one system at a time -- the strip along the bottom of a
+    play-along video, say -- yield page images that are single staff lines. One
+    line per PDF page is unreadable as a score, so they are re-assembled into
+    sheets the way the original printed score would have laid them out.
+    """
+    background = 0 if invert else 255
+    sheets: List[np.ndarray] = []
+    for start in range(0, len(images), per_sheet):
+        group = images[start : start + per_sheet]
+        width = max(im.shape[1] for im in group)
+        height = sum(im.shape[0] for im in group) + gutter * (len(group) - 1)
+        sheet = np.full((height, width, 3), background, dtype=np.uint8)
+        y = 0
+        for im in group:
+            sheet[y : y + im.shape[0], 0 : im.shape[1]] = im
+            y += im.shape[0] + gutter
+        sheets.append(sheet)
+    return sheets
+
+
 def stage7_crop_and_export(
     pages: List[Page],
-    manual_crop: Optional[Tuple[float, float, float, float]],
     autocrop: bool,
     margin: int,
     invert: bool,
     pages_dir: Path,
     output_path: Path,
+    tile: int = 0,
+    gutter: int = 24,
+    page_size: str = "none",
+    page_margin_mm: float = 10.0,
 ) -> List[Path]:
     if not pages:
         raise RuntimeError("no pages survived the pipeline; nothing to export")
 
-    if manual_crop is not None:
-        for p in pages:
-            p.image = apply_manual_crop(p.image, manual_crop)
+    # Page images arrive already reduced to any manual crop -- load_frame applies
+    # it on the way in, so detection and output share one region.
 
     # All page images must share dimensions for a uniform crop box / clean PDF.
     shapes = {p.image.shape[:2] for p in pages}
@@ -729,11 +787,32 @@ def stage7_crop_and_export(
         cv2.imwrite(str(out_path), p.image)
         out_paths.append(out_path)
 
+    pdf_paths = out_paths
+    if tile > 1:
+        sheets = tile_images([p.image for p in pages], tile, gutter, invert)
+        pdf_paths = []
+        for i, sheet in enumerate(sheets, start=1):
+            sheet_path = pages_dir / f"sheet_{i:02d}.png"
+            cv2.imwrite(str(sheet_path), sheet)
+            pdf_paths.append(sheet_path)
+        LOG.info("tiled %d pages into %d sheets (%d per sheet)", len(pages), len(sheets), tile)
+
     import img2pdf
 
+    convert_kwargs = {}
+    if page_size and page_size != "none":
+        width_mm, height_mm = PAGE_SIZES_MM[page_size]
+        convert_kwargs["layout_fun"] = img2pdf.get_layout_fun(
+            pagesize=(img2pdf.mm_to_pt(width_mm), img2pdf.mm_to_pt(height_mm)),
+            border=(img2pdf.mm_to_pt(page_margin_mm), img2pdf.mm_to_pt(page_margin_mm)),
+            fit=img2pdf.FitMode.into,
+            auto_orient=True,
+        )
+        LOG.info("laying pages out on %s with a %dmm border", page_size, page_margin_mm)
+
     with open(output_path, "wb") as f:
-        f.write(img2pdf.convert([str(pp) for pp in out_paths]))
-    LOG.info("wrote %d pages to %s", len(out_paths), output_path)
+        f.write(img2pdf.convert([str(pp) for pp in pdf_paths], **convert_kwargs))
+    LOG.info("wrote %d pages to %s", len(pdf_paths), output_path)
     return out_paths
 
 
@@ -853,7 +932,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--margin", type=int, default=12, help="padding in px added around the auto-crop bounding box")
     p.add_argument("--no-autocrop", dest="autocrop", action="store_false", help="disable automatic crop to the union of ink across pages")
-    p.add_argument("--crop", type=str, default=None, help="manual crop 'x,y,w,h' as fractions of the frame (0-1), applied before auto-crop")
+    p.add_argument("--crop", type=str, default=None, help="manual crop 'x,y,w,h' as fractions of the frame (0-1); narrows detection as well as output")
+    p.add_argument("--tile", type=int, default=0, metavar="N", help="stack N detected pages onto each PDF sheet; use for scores shown one staff line at a time (0 = one page per sheet)")
+    p.add_argument("--gutter", type=int, default=24, help="vertical gap in px between stacked pages when --tile is used")
+    p.add_argument("--page-size", choices=["none", "a4", "letter"], default="none", help="fit each page onto a fixed paper size ('none' keeps the image's own size)")
+    p.add_argument("--page-margin", type=float, default=10.0, metavar="MM", help="border in mm left around the image when --page-size is set")
 
     p.add_argument("--dump-report", action="store_true", help="write workdir/report.json in addition to the printed table")
     p.add_argument("--debug-frames", action="store_true", help="save each run's pre-dedupe composite image to workdir/debug/")
@@ -905,11 +988,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         frames = stage2_sample_frames(
             video_path, frames_dir, args.fps, args.start, args.end, args.force, ffmpeg_bin, args.verbose
         )
-        stage3_compute_features(frames, args.invert)
+        stage3_compute_features(frames, args.invert, manual_crop)
         runs = stage4_segment(frames, args.change_threshold, args.min_page_seconds, args.staff_threshold)
 
         debug_dir = (workdir / "debug") if args.debug_frames else None
-        pages = stage5_build_pages(runs, args.median_frames, debug_dir)
+        pages = stage5_build_pages(runs, args.median_frames, debug_dir, manual_crop)
         if not pages:
             LOG.error("no candidate pages were produced; try lowering --staff-threshold or --min-page-seconds")
             return 1
@@ -920,7 +1003,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 1
 
         pages_dir = workdir / "pages"
-        stage7_crop_and_export(kept_pages, manual_crop, args.autocrop, args.margin, args.invert, pages_dir, args.output)
+        stage7_crop_and_export(
+            kept_pages, args.autocrop, args.margin, args.invert, pages_dir, args.output,
+            tile=args.tile, gutter=args.gutter,
+            page_size=args.page_size, page_margin_mm=args.page_margin,
+        )
 
         report_path = (workdir / "report.json") if args.dump_report else None
         build_and_print_report(runs, pages, report_path)
