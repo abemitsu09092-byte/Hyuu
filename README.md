@@ -62,14 +62,83 @@ python3 extract_sheets.py "https://www.youtube.com/watch?v=2eRFYo5QAPE" \
 python3 extract_sheets.py ./recital.mp4 --output sheets.pdf
 ```
 
-### 重要: このコンテナ環境ではYouTubeに接続できません
+### JavaScriptランタイムについて
 
-このリポジトリのCI/開発コンテナ環境は組織のegressポリシーにより
-`www.youtube.com` への通信がブロックされています（`yt-dlp` によるダウンロード
-が失敗します）。**YouTube URLを指定して実行する場合は、インターネット
-（YouTube）に到達できる別のマシン上でこのツールを実行してください。**
+現在の `yt-dlp` は YouTube のプレイヤーチャレンジをJavaScriptで解くため、
+`deno` / `node` / `bun` のいずれかを必要とします（無いとフォーマットが
+欠落します）。本ツールはPATH上から自動検出して `yt-dlp` に渡すので、
+通常は何もしなくて構いません。明示したい場合は `--js-runtimes` を使います。
+
+```bash
+--js-runtimes node:/opt/node22/bin/node
+```
+
+注意: `node` は **22以上** が必要です。20系は `unsupported` として無視されます。
+
+
+### 重要: このコンテナ環境からはYouTube動画をダウンロードできません
+
+`www.youtube.com` への通信自体は到達しますが、共有データセンターIPからの
+アクセスであるため YouTube 側の bot 判定に阻まれ、動画ストリームが取得
+できません（`HTTP 429` および `Sign in to confirm you're not a bot` /
+`LOGIN_REQUIRED`）。全プレイヤークライアント（tv / android / ios / web系）、
+PO Token プロバイダ（bgutil）を用意しても結果は同じです。
+
+**YouTube URLを指定して実行する場合は、普段YouTubeを見ているマシン上で、
+ログイン済みブラウザのcookieを渡して実行してください。**
+
+```bash
+python3 extract_sheets.py "https://www.youtube.com/watch?v=..." \
+  --cookies-from-browser chrome \
+  --output sheets.pdf
+```
+
 ローカル動画ファイルに対する処理（フレーム抽出以降のパイプライン全体）は、
-このコンテナ内でも問題なく動作します。
+このコンテナ内でも問題なく動作します。手元でダウンロードした動画ファイルを
+渡す運用でも構いません。
+
+
+## 資料として使うか、演奏に使うか（`--dedupe`）
+
+同じ動画でも、用途によって「重複」の意味が変わります。
+
+- **資料・保存用** → `--dedupe all`（デフォルト）。繰り返し演奏される区間は
+  1回だけ載り、曲に出てくる譜面が過不足なく1部そろいます。
+- **演奏（叩きながら見る）用** → `--dedupe adjacent`。**繰り返しをそのまま残す**
+  ので、上から順に追っていけば動画の進行と一致します。`all` だと2回目のサビが
+  PDFから消えてしまい、見ながら演奏できません。
+  なお同じ1段が検出上いくつかの区間に割れた場合（連続する重複）はこのモードでも
+  畳まれるので、同じ段が無駄に並ぶことはありません。
+- `--dedupe none` は畳まずそのまま出します。切り分け用途向けです。
+
+
+## 譜面が画面の一部にしか映っていない場合（重要）
+
+演奏動画では、画面の大半が演奏者で、譜面は下端の帯に1段ずつ表示される、という
+構成がよくあります。この場合 **`--crop` の指定が必須** です。`--crop` は出力を
+トリミングするだけでなく、**検出そのものをその領域に限定します**。指定しないと
+演奏者の動きがインクマスクの差分を支配してしまい、譜面の切り替わりが埋もれて
+検出できません（同時に五線譜検出も失敗します）。
+
+さらに1段ずつ表示されるタイプでは、1段=1PDFページでは譜面として読めないため、
+`--tile N` で複数段を1ページに積み上げます。
+
+実例（ドラム練習動画。画面下部に1段ずつ譜面が出るタイプ、4分の動画）:
+
+```bash
+python3 extract_sheets.py ./drum_practice.mp4 \
+  --crop 0,0.7421,1.0,0.1403 \
+  --fps 2 \
+  --tile 11 --gutter 30 \
+  --page-size a4 --page-margin 8 \
+  --dedupe adjacent \
+  --output score.pdf --dump-report
+```
+
+`--crop` の値の決め方は、動画からフレームを1枚書き出して、譜面の帯が上下
+どのあたり（フレーム高に対する割合）にあるかを測るのが確実です。帯の上端に
+映像が数pxでも混入すると、その動きが差分ノイズになるので、**やや内側に**
+取ってください。
 
 
 ## 処理の流れ（パイプライン）
@@ -94,10 +163,17 @@ python3 extract_sheets.py ./recital.mp4 --output sheets.pdf
    ハイライトなど一時的なオーバーレイを消し、静的なページだけを残します。
 6. **重複除去 (dedupe)**: 自作のdHash（差分ハッシュ）とインクマスクのIoUの
    両方が閾値を満たすページを重複と判定し、初出（最も早いタイムスタンプ）を
-   残して以降を破棄します。
+   残して以降を破棄します。`--dedupe adjacent` では比較相手を直前のページのみに
+   限定するため、曲中の繰り返しは残り、検出上の分割だけが畳まれます。
 7. **クロップ & 出力**: 採用された全ページのインク領域の和集合バウンディング
    ボックスに `--margin` 分の余白を足して統一クロップ（`--no-autocrop` で無効
-   化可）。`img2pdf` でPDFに組み立てます。
+   化可）。`--tile N` 指定時はN段を1枚に積み上げ、`--page-size` 指定時は用紙
+   サイズに収めた上で、`img2pdf` でPDFに組み立てます。最後のシートは段数が
+   足りなくても他と同じ大きさに揃えられるので、全ページの向きと段の大きさが
+   一致します。埋め込む画像は既定でグレースケールJPEGです（`--pdf-image`）。
+
+なお `--crop` は 2. の直後（各フレームを読み込んだ時点）で適用されるため、
+3.〜7. のすべてが譜面領域だけを見ることになります。
 
 
 ## CLIオプション一覧
@@ -108,6 +184,10 @@ python3 extract_sheets.py ./recital.mp4 --output sheets.pdf
 | `--workdir` | `./work` | 中間ファイル（動画・フレーム・ページ画像・レポート）の作業ディレクトリ |
 | `--output` | `sheets.pdf` | 出力PDFのパス |
 | `--max-height` | `1080` | ダウンロード時の高さ上限（yt-dlpのフォーマット選択に使用） |
+| `--cookies` | `None` | Netscape形式のcookieファイル。YouTubeがログイン/bot確認を要求する場合に必要 |
+| `--cookies-from-browser` | `None` | ローカルのブラウザから直接cookieを取得（`chrome` / `firefox` / `edge` / `safari` など。書式は `BROWSER[+KEYRING][:PROFILE][::CONTAINER]`） |
+| `--js-runtimes` | (自動検出) | yt-dlpが使うJSランタイム `RUNTIME[:PATH]`。省略時はPATH上の deno / node / bun を自動検出 |
+| `--ytdlp-arg` | `[]` | yt-dlpへ生のオプションを転送（トークンごとに繰り返す。例: `--ytdlp-arg --extractor-args --ytdlp-arg youtube:player_client=tv`） |
 | `--force` | `False` | キャッシュされた中間ファイルを無視してすべてやり直す |
 | `--fps` | `2.0` | フレームサンプリングのfps |
 | `--start` | `None` | 解析範囲の開始秒（省略時は動画の先頭から） |
@@ -119,9 +199,16 @@ python3 extract_sheets.py ./recital.mp4 --output sheets.pdf
 | `--median-frames` | `15` | 1ページあたり中央値合成に使う最大フレーム数 |
 | `--hash-threshold` | `6` | dHashのハミング距離がこれ以下なら重複候補 |
 | `--iou-threshold` | `0.85` | インクマスクのIoUがこれ以上なら重複候補（hash条件と両方満たす必要あり） |
+| `--dedupe` | `all` | `all`=同じページは1回だけ（資料用） / `adjacent`=連続した重複だけ畳む（**演奏用**。繰り返しは残る） / `none`=一切畳まない |
 | `--margin` | `12` | 自動クロップのバウンディングボックスに足す余白（px） |
 | `--no-autocrop` | (autocrop有効) | 自動クロップを無効化 |
-| `--crop` | `None` | 手動クロップ `x,y,w,h`（フレームに対する0〜1の割合）。自動クロップの**前**に適用 |
+| `--crop` | `None` | 手動クロップ `x,y,w,h`（フレームに対する0〜1の割合）。**検出段から**この領域だけを見る |
+| `--tile` | `0` | N段を1枚のPDFページに縦に積む（0=1段1ページ）。1段ずつ表示されるタイプの譜面向け |
+| `--gutter` | `24` | `--tile` 使用時、段と段の間隔（px） |
+| `--page-size` | `none` | `a4` / `letter` を指定すると用紙サイズに収める（`none` は画像そのままのサイズ） |
+| `--page-margin` | `10` | `--page-size` 指定時に確保する余白（mm） |
+| `--pdf-image` | `gray-jpeg` | PDF内の画像形式。`gray-jpeg`=グレースケールJPEG（推奨） / `rgb-lossless`=カラー無劣化（ビューアによっては白紙になる。下記参照） |
+| `--jpeg-quality` | `92` | `--pdf-image gray-jpeg` のときのJPEG品質 |
 | `--dump-report` | `False` | `workdir/report.json` にも解析結果を書き出す |
 | `--debug-frames` | `False` | 重複除去前の各区間の合成画像を `workdir/debug/` に保存 |
 | `--verbose` | `False` | 詳細ログをstderrに出力 |
@@ -164,6 +251,27 @@ python3 extract_sheets.py ./recital.mp4 --output sheets.pdf
 - **別ページなのに重複として誤って統合される**
   → `--hash-threshold` を下げる、`--iou-threshold` を上げる。
 
+### 1段ずつしか譜面が出ない動画で、ページがほとんど検出されない
+
+`--crop` で譜面の帯だけに絞ってください（上記「譜面が画面の一部にしか
+映っていない場合」を参照）。絞った上でまだ段の切り替わりが検出されない場合は、
+五線そのものがインクの大半を占めるため差分が出にくくなっているので、
+`--change-threshold` を下げます。逆に帯の上端に映像が混入していると過剰分割に
+なるので、その場合は `--crop` を内側に詰めます。
+
+
+### PDFが白紙で表示される
+
+`--pdf-image rgb-lossless` を指定した場合に起こり得ます。無劣化のRGB画像を
+そのまま埋め込むと1ページあたり展開時10MBを超えることがあり、Googleドライブの
+プレビューや一部のモバイルPDFビューアはこれをエラーも出さず**何も描画しない**
+（＝白紙に見える）ためです。PDFファイル自体は壊れていません。
+
+既定の `gray-jpeg` を使ってください。譜面は白黒なのでグレースケール化による
+情報の損失はなく、展開時サイズが約1/5になり、JPEG(DCTDecode)はPDFで最も広く
+サポートされている画像形式です。
+
+
 ### クロップがおかしい
 
 - 譜面の周囲に黒帯がある動画では、黒帯も「暗い画素=インク」とみなされて
@@ -195,3 +303,35 @@ python3 extract_sheets.py ./recital.mp4 --output sheets.pdf
   クロップ全体に影響します。`--crop` で先に絞り込むのが確実です。
 - ページ検出はカメラが固定（画面/譜面台を定点で映している）ことを前提
   としています。カメラが大きくパン・ズームする映像には向きません。
+
+
+## ダウンロードが失敗するとき
+
+### `Sign in to confirm you're not a bot` / `LOGIN_REQUIRED` で止まる
+
+YouTubeがそのIPをbotとみなしています。データセンター/VPN/共有IPで頻発します。
+ログイン済みブラウザのあるマシンで `--cookies-from-browser chrome` を付けて
+実行するのが最も確実です。cookieファイルを使う場合は `--cookies cookies.txt`。
+
+年齢制限やメンバー限定動画の場合も同じ対処になります。
+
+### `HTTP Error 429: Too Many Requests`
+
+同じIPからのアクセスが多すぎます。時間を空けるか、別の回線から実行してください。
+
+### フォーマットが取れない / 一部フォーマットが欠落する
+
+JSランタイムが無いか、バージョンが古い可能性があります。`node` は22以上が必要
+です。`--js-runtimes node:/path/to/node` で明示してください。
+
+### それでも駄目なとき
+
+`--ytdlp-arg` で任意のyt-dlpオプションを転送できます。プレイヤークライアントを
+切り替えたい場合は次のように指定します。
+
+```bash
+--ytdlp-arg --extractor-args --ytdlp-arg youtube:player_client=tv
+```
+
+最終手段として、手元で動画をダウンロードし、ローカルファイルパスを渡してくだ
+さい（そちらの経路は完全に同じ処理を行います）。

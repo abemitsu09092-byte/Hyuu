@@ -1,12 +1,16 @@
 # 中間生成物（動画・フレーム画像・抽出ページ）
-work/
+# 複数の動画を並行して処理するとき work2/, work_foo/ のように増えるので前方一致で無視する
+work*/
 *.mp4
 *.mkv
 *.webm
 *.part
 
-# 出力 PDF
+# 出力 PDF と、書き出した譜面画像
 *.pdf
+*.jpg
+*.jpeg
+*.png
 
 # Python
 __pycache__/

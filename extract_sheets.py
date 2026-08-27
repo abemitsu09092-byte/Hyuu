@@ -33,6 +33,7 @@ LOG = logging.getLogger("extract_sheets")
 # --------------------------------------------------------------------------
 
 FEATURE_LONG_SIDE = 1000  # downscaled long side used for feature computation
+PAGE_SIZES_MM = {"a4": (210.0, 297.0), "letter": (215.9, 279.4)}
 POPCOUNT_TABLE = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint32)
 
 
@@ -55,6 +56,12 @@ def find_ffmpeg() -> str:
             "ffmpeg was not found on PATH and imageio_ffmpeg could not supply one. "
             "Install ffmpeg or `pip install imageio-ffmpeg`."
         ) from exc
+
+
+def _looks_like_bot_wall(exc: BaseException) -> bool:
+    """True when a yt-dlp failure is YouTube's sign-in / bot-check refusal."""
+    msg = str(exc).lower()
+    return "not a bot" in msg or "sign in" in msg or "login_required" in msg
 
 
 def is_url(text: str) -> bool:
@@ -182,6 +189,23 @@ class Page:
 # --------------------------------------------------------------------------
 
 
+def detect_js_runtime() -> Optional[str]:
+    """Pick a JavaScript runtime for yt-dlp from whatever is on PATH.
+
+    Recent yt-dlp versions solve YouTube's player challenge in JS and warn that
+    extraction without a runtime is deprecated; only deno is enabled by default,
+    so a machine with just node installed silently loses formats.
+    """
+    for name in ("deno", "node", "bun"):
+        path = shutil.which(name)
+        if path:
+            # Hand over the resolved path, not just the name: yt-dlp does its own
+            # lookup and can land on a different (often older, unsupported) copy
+            # than the one first on PATH.
+            return f"{name}:{path}"
+    return None
+
+
 def stage1_acquire(
     input_arg: str,
     workdir: Path,
@@ -190,6 +214,9 @@ def stage1_acquire(
     ffmpeg_bin: str,
     verbose: bool,
     cookies: Optional[str] = None,
+    cookies_from_browser: Optional[str] = None,
+    js_runtimes: Optional[str] = None,
+    ytdlp_args: Optional[List[str]] = None,
 ) -> Path:
     if not is_url(input_arg):
         local = Path(input_arg).expanduser().resolve()
@@ -222,7 +249,28 @@ def stage1_acquire(
         f"best[height<={max_height}][ext=mp4]/"
         f"best[height<={max_height}]/best"
     )
-    ydl_opts = {
+    # Anything the caller wants to hand straight to yt-dlp is parsed by yt-dlp
+    # itself rather than hand-mapped here, so option shapes stay correct as
+    # yt-dlp evolves. Our own settings are layered on top.
+    passthrough: List[str] = []
+    if cookies_from_browser:
+        passthrough += ["--cookies-from-browser", cookies_from_browser]
+    runtime = js_runtimes if js_runtimes is not None else detect_js_runtime()
+    if runtime:
+        passthrough += ["--js-runtimes", runtime]
+    passthrough += list(ytdlp_args or [])
+
+    ydl_opts = {}
+    if passthrough:
+        LOG.info("extra yt-dlp options: %s", " ".join(passthrough))
+        try:
+            ydl_opts.update(yt_dlp.parse_options(passthrough + [input_arg]).ydl_opts)
+        except SystemExit as exc:  # optparse exits instead of raising
+            raise RuntimeError(
+                f"yt-dlp rejected the passthrough options: {' '.join(passthrough)}"
+            ) from exc
+
+    ydl_opts.update({
         "format": fmt,
         "outtmpl": str(workdir / "source.%(ext)s"),
         "quiet": not verbose,
@@ -233,11 +281,28 @@ def stage1_acquire(
         "ffmpeg_location": ffmpeg_bin,
         "retries": 3,
         "noplaylist": True,
-    }
+        # yt-dlp's *CLI* default is ignoreerrors='only_download', which turns a
+        # failed download into a return code instead of an exception. Passthrough
+        # options are parsed through that CLI layer, so pin this back to False or
+        # a refusal would surface later as a confusing "no source.* file" error.
+        "ignoreerrors": False,
+    })
     if cookies:
         ydl_opts["cookiefile"] = str(Path(cookies).expanduser())
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([input_arg])
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([input_arg])
+    except yt_dlp.utils.DownloadError as exc:
+        if not (cookies or cookies_from_browser) and _looks_like_bot_wall(exc):
+            raise RuntimeError(
+                "YouTube refused to serve the video streams and asked to confirm "
+                "you are not a bot. This happens on datacenter/shared IPs and on "
+                "age- or sign-in-restricted videos. Re-run from a machine with a "
+                "signed-in browser and add --cookies-from-browser chrome (or "
+                "firefox/edge/safari), or export a Netscape cookie file and pass "
+                "--cookies cookies.txt."
+            ) from exc
+        raise
 
     downloaded = sorted(workdir.glob("source.*"))
     downloaded = [p for p in downloaded if p.suffix.lower() not in (".part", ".ytdl")]
@@ -368,7 +433,11 @@ def staff_confidence(mask: np.ndarray) -> float:
     if len(clusters) < 5:
         return 0.0
 
-    min_span, max_span = 8, int(0.35 * h)
+    # A staff group may legitimately fill almost the whole frame: cropping to a
+    # score strip (one system along the bottom of a play-along video) leaves an
+    # image that *is* a single staff. Only the spread-across-everything case,
+    # where five unrelated ink spikes masquerade as staff lines, is excluded.
+    min_span, max_span = 8, max(8, int(0.9 * h))
     best = 0.0
     for i in range(len(clusters) - 4):
         window = clusters[i : i + 5]
@@ -389,11 +458,32 @@ def sharpness_score(gray: np.ndarray) -> float:
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
-def stage3_compute_features(frames: List[FrameMeta], invert: bool) -> None:
+def load_frame(
+    path: Path, crop: Optional[Tuple[float, float, float, float]]
+) -> Optional[np.ndarray]:
+    """Read a sampled frame, reduced to the region the score actually occupies.
+
+    Every stage that touches pixels goes through here, so a manual crop narrows
+    detection as well as output. That matters whenever the score is only part of
+    the picture -- a performance shot with a score strip along the bottom, say --
+    because the performer then dominates both the ink mask and its frame-to-frame
+    difference, which buries the score's own page changes in noise.
+    """
+    img = cv2.imread(str(path))
+    if img is None:
+        return None
+    return apply_manual_crop(img, crop) if crop is not None else img
+
+
+def stage3_compute_features(
+    frames: List[FrameMeta],
+    invert: bool,
+    crop: Optional[Tuple[float, float, float, float]] = None,
+) -> None:
     LOG.info("computing per-frame features for %d frames", len(frames))
     target_size: Optional[Tuple[int, int]] = None
     for i, fm in enumerate(frames):
-        img = cv2.imread(str(fm.path))
+        img = load_frame(fm.path, crop)
         if img is None:
             LOG.warning("could not read frame %s, skipping features (treated as blank)", fm.path)
             continue
@@ -462,7 +552,12 @@ def stage4_segment(
 # --------------------------------------------------------------------------
 
 
-def stage5_build_pages(runs: List[Run], median_frames: int, debug_dir: Optional[Path]) -> List[Page]:
+def stage5_build_pages(
+    runs: List[Run],
+    median_frames: int,
+    debug_dir: Optional[Path],
+    crop: Optional[Tuple[float, float, float, float]] = None,
+) -> List[Page]:
     pages: List[Page] = []
     kept_runs = [r for r in runs if r.kept]
     LOG.info("building composite images for %d pages", len(kept_runs))
@@ -483,7 +578,7 @@ def stage5_build_pages(runs: List[Run], median_frames: int, debug_dir: Optional[
         if len(usable_idxs) >= 2:
             imgs = []
             for i in usable_idxs:
-                img = cv2.imread(str(frames[i].path))
+                img = load_frame(frames[i].path, crop)
                 if img is not None:
                     imgs.append(img.astype(np.float32))
             if len(imgs) >= 2:
@@ -493,7 +588,7 @@ def stage5_build_pages(runs: List[Run], median_frames: int, debug_dir: Optional[
         if image is None:
             # fallback: single sharpest frame in the run
             best_i = int(np.argmax(sharpness_values))
-            img = cv2.imread(str(frames[best_i].path))
+            img = load_frame(frames[best_i].path, crop)
             if img is None:
                 LOG.warning("run at %.2fs produced no readable frames, skipping", run.start_ts)
                 continue
@@ -529,7 +624,33 @@ def hamming(a: np.ndarray, b: np.ndarray) -> int:
     return int(np.count_nonzero(a != b))
 
 
-def stage6_dedupe(pages: List[Page], hash_threshold: int, iou_threshold: float, invert: bool) -> List[Page]:
+def stage6_dedupe(
+    pages: List[Page],
+    hash_threshold: int,
+    iou_threshold: float,
+    invert: bool,
+    mode: str = "all",
+) -> List[Page]:
+    """Drop repeated pages, in temporal (first-appearance) order.
+
+    `mode` decides what "repeated" means, and the right answer depends on what
+    the PDF is for:
+
+    "all"      - a page matching *any* earlier page is dropped. Gives the score
+                 as a reference document: every distinct page exactly once.
+    "adjacent" - only a page matching the one immediately before it is dropped.
+                 A section played twice stays in the PDF twice, so the pages run
+                 in playing order and can be followed straight through, while a
+                 single page that segmentation split into several runs still
+                 collapses back to one.
+    "none"     - keep every candidate page.
+    """
+    if mode == "none":
+        for i, p in enumerate(pages, start=1):
+            p.page_no = i
+        LOG.info("dedupe disabled: keeping all %d pages", len(pages))
+        return list(pages)
+
     # pages are already in temporal (first-appearance) order
     small_size = (256, 256)
     for p in pages:
@@ -541,7 +662,8 @@ def stage6_dedupe(pages: List[Page], hash_threshold: int, iou_threshold: float, 
     kept: List[Page] = []
     for p in pages:
         dup_target: Optional[Page] = None
-        for k in kept:
+        candidates = kept[-1:] if mode == "adjacent" else kept
+        for k in candidates:
             hd = hamming(p.dhash, k.dhash)
             if hd > hash_threshold:
                 continue
@@ -626,21 +748,73 @@ def compute_autocrop_box(pages: List[Page], invert: bool, margin: int) -> Tuple[
     return x0, y0, x1 - x0, y1 - y0
 
 
+def tile_images(
+    images: List[np.ndarray], per_sheet: int, gutter: int, invert: bool
+) -> List[np.ndarray]:
+    """Stack consecutive page images vertically, `per_sheet` to a sheet.
+
+    Scores shown one system at a time -- the strip along the bottom of a
+    play-along video, say -- yield page images that are single staff lines. One
+    line per PDF page is unreadable as a score, so they are re-assembled into
+    sheets the way the original printed score would have laid them out.
+    """
+    background = 0 if invert else 255
+    groups = [images[i : i + per_sheet] for i in range(0, len(images), per_sheet)]
+    width = max(im.shape[1] for im in images)
+    # Size every sheet as if it were full, so a short final sheet still has the
+    # shape of the others. Otherwise the last one comes out wide and squat, and
+    # the PDF gives it a different page orientation and a different scale from
+    # the rest -- a score that changes orientation on the last page.
+    full = groups[0]
+    height = sum(im.shape[0] for im in full) + gutter * (len(full) - 1)
+    sheets: List[np.ndarray] = []
+    for group in groups:
+        sheet = np.full((height, width, 3), background, dtype=np.uint8)
+        y = 0
+        for im in group:
+            sheet[y : y + im.shape[0], 0 : im.shape[1]] = im
+            y += im.shape[0] + gutter
+        sheets.append(sheet)
+    return sheets
+
+
+def encode_for_pdf(src: Path, dest: Path, quality: int) -> Path:
+    """Re-encode a page image as a grayscale JPEG for embedding in the PDF.
+
+    The obvious thing is to embed the PNGs directly, which img2pdf does as
+    lossless Flate RGB. That produces a PDF some viewers -- Google Drive's
+    preview and several mobile readers among them -- render as blank pages: a
+    full-page 200dpi RGB raster decodes to over 11MB per page, and rather than
+    fail loudly they draw nothing. Grayscale JPEG cuts that by roughly five
+    times and is the most universally supported image codec in PDF. A score is
+    black on white, so dropping colour costs nothing.
+    """
+    from PIL import Image
+
+    with Image.open(src) as im:
+        im.convert("L").save(dest, format="JPEG", quality=quality, optimize=True)
+    return dest
+
+
 def stage7_crop_and_export(
     pages: List[Page],
-    manual_crop: Optional[Tuple[float, float, float, float]],
     autocrop: bool,
     margin: int,
     invert: bool,
     pages_dir: Path,
     output_path: Path,
+    tile: int = 0,
+    gutter: int = 24,
+    page_size: str = "none",
+    page_margin_mm: float = 10.0,
+    pdf_image: str = "gray-jpeg",
+    jpeg_quality: int = 92,
 ) -> List[Path]:
     if not pages:
         raise RuntimeError("no pages survived the pipeline; nothing to export")
 
-    if manual_crop is not None:
-        for p in pages:
-            p.image = apply_manual_crop(p.image, manual_crop)
+    # Page images arrive already reduced to any manual crop -- load_frame applies
+    # it on the way in, so detection and output share one region.
 
     # All page images must share dimensions for a uniform crop box / clean PDF.
     shapes = {p.image.shape[:2] for p in pages}
@@ -665,11 +839,39 @@ def stage7_crop_and_export(
         cv2.imwrite(str(out_path), p.image)
         out_paths.append(out_path)
 
+    pdf_paths = out_paths
+    if tile > 1:
+        sheets = tile_images([p.image for p in pages], tile, gutter, invert)
+        pdf_paths = []
+        for i, sheet in enumerate(sheets, start=1):
+            sheet_path = pages_dir / f"sheet_{i:02d}.png"
+            cv2.imwrite(str(sheet_path), sheet)
+            pdf_paths.append(sheet_path)
+        LOG.info("tiled %d pages into %d sheets (%d per sheet)", len(pages), len(sheets), tile)
+
+    if pdf_image == "gray-jpeg":
+        pdf_paths = [
+            encode_for_pdf(src, src.with_suffix(".jpg"), jpeg_quality) for src in pdf_paths
+        ]
+
     import img2pdf
 
+    convert_kwargs = {}
+    if page_size and page_size != "none":
+        width_mm, height_mm = PAGE_SIZES_MM[page_size]
+        convert_kwargs["layout_fun"] = img2pdf.get_layout_fun(
+            pagesize=(img2pdf.mm_to_pt(width_mm), img2pdf.mm_to_pt(height_mm)),
+            border=(img2pdf.mm_to_pt(page_margin_mm), img2pdf.mm_to_pt(page_margin_mm)),
+            fit=img2pdf.FitMode.into,
+            # An explicit paper size means that orientation. Auto-orient would
+            # turn any sheet that happens to be wider than it is tall sideways.
+            auto_orient=False,
+        )
+        LOG.info("laying pages out on %s with a %dmm border", page_size, page_margin_mm)
+
     with open(output_path, "wb") as f:
-        f.write(img2pdf.convert([str(pp) for pp in out_paths]))
-    LOG.info("wrote %d pages to %s", len(out_paths), output_path)
+        f.write(img2pdf.convert([str(pp) for pp in pdf_paths], **convert_kwargs))
+    LOG.info("wrote %d pages to %s", len(pdf_paths), output_path)
     return out_paths
 
 
@@ -747,6 +949,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Netscape-format cookie file passed to yt-dlp; needed when YouTube "
              "demands sign-in or a bot check for the video",
     )
+    p.add_argument(
+        "--cookies-from-browser",
+        default=None,
+        metavar="BROWSER[+KEYRING][:PROFILE][::CONTAINER]",
+        help="take cookies straight from a locally installed browser (chrome, "
+             "firefox, edge, safari, ...) instead of a cookie file",
+    )
+    p.add_argument(
+        "--js-runtimes",
+        default=None,
+        metavar="RUNTIME[:PATH]",
+        help="JavaScript runtime yt-dlp may use for YouTube's player challenge; "
+             "defaults to the first of deno/node/bun found on PATH",
+    )
+    p.add_argument(
+        "--ytdlp-arg",
+        dest="ytdlp_args",
+        action="append",
+        default=[],
+        metavar="ARG",
+        help="raw extra argument forwarded to yt-dlp; repeat per token, e.g. "
+             "--ytdlp-arg --extractor-args --ytdlp-arg youtube:player_client=tv",
+    )
     p.add_argument("--force", action="store_true", help="ignore cached intermediates and redo everything")
 
     p.add_argument("--fps", type=float, default=2.0, help="frame sampling rate")
@@ -763,10 +988,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--hash-threshold", type=int, default=6, help="max dHash hamming distance to consider pages duplicates")
     p.add_argument("--iou-threshold", type=float, default=0.85, help="min ink-mask IoU to consider pages duplicates")
+    p.add_argument("--dedupe", choices=["all", "adjacent", "none"], default="all", help="'all' keeps each distinct page once; 'adjacent' collapses only consecutive repeats, so a repeated section stays in playing order; 'none' keeps every page")
 
     p.add_argument("--margin", type=int, default=12, help="padding in px added around the auto-crop bounding box")
     p.add_argument("--no-autocrop", dest="autocrop", action="store_false", help="disable automatic crop to the union of ink across pages")
-    p.add_argument("--crop", type=str, default=None, help="manual crop 'x,y,w,h' as fractions of the frame (0-1), applied before auto-crop")
+    p.add_argument("--crop", type=str, default=None, help="manual crop 'x,y,w,h' as fractions of the frame (0-1); narrows detection as well as output")
+    p.add_argument("--tile", type=int, default=0, metavar="N", help="stack N detected pages onto each PDF sheet; use for scores shown one staff line at a time (0 = one page per sheet)")
+    p.add_argument("--gutter", type=int, default=24, help="vertical gap in px between stacked pages when --tile is used")
+    p.add_argument("--page-size", choices=["none", "a4", "letter"], default="none", help="fit each page onto a fixed paper size ('none' keeps the image's own size)")
+    p.add_argument("--page-margin", type=float, default=10.0, metavar="MM", help="border in mm left around the image when --page-size is set")
+    p.add_argument("--pdf-image", choices=["gray-jpeg", "rgb-lossless"], default="gray-jpeg", help="how page images are encoded inside the PDF; 'rgb-lossless' keeps colour but produces large rasters some viewers render as blank pages")
+    p.add_argument("--jpeg-quality", type=int, default=92, help="JPEG quality when --pdf-image is gray-jpeg")
 
     p.add_argument("--dump-report", action="store_true", help="write workdir/report.json in addition to the printed table")
     p.add_argument("--debug-frames", action="store_true", help="save each run's pre-dedupe composite image to workdir/debug/")
@@ -810,27 +1042,35 @@ def main(argv: Optional[List[str]] = None) -> int:
             ffmpeg_bin,
             args.verbose,
             cookies=args.cookies,
+            cookies_from_browser=args.cookies_from_browser,
+            js_runtimes=args.js_runtimes,
+            ytdlp_args=args.ytdlp_args,
         )
         frames_dir = workdir / "frames"
         frames = stage2_sample_frames(
             video_path, frames_dir, args.fps, args.start, args.end, args.force, ffmpeg_bin, args.verbose
         )
-        stage3_compute_features(frames, args.invert)
+        stage3_compute_features(frames, args.invert, manual_crop)
         runs = stage4_segment(frames, args.change_threshold, args.min_page_seconds, args.staff_threshold)
 
         debug_dir = (workdir / "debug") if args.debug_frames else None
-        pages = stage5_build_pages(runs, args.median_frames, debug_dir)
+        pages = stage5_build_pages(runs, args.median_frames, debug_dir, manual_crop)
         if not pages:
             LOG.error("no candidate pages were produced; try lowering --staff-threshold or --min-page-seconds")
             return 1
 
-        kept_pages = stage6_dedupe(pages, args.hash_threshold, args.iou_threshold, args.invert)
+        kept_pages = stage6_dedupe(pages, args.hash_threshold, args.iou_threshold, args.invert, args.dedupe)
         if not kept_pages:
             LOG.error("all candidate pages were dropped by dedupe; check --hash-threshold/--iou-threshold")
             return 1
 
         pages_dir = workdir / "pages"
-        stage7_crop_and_export(kept_pages, manual_crop, args.autocrop, args.margin, args.invert, pages_dir, args.output)
+        stage7_crop_and_export(
+            kept_pages, args.autocrop, args.margin, args.invert, pages_dir, args.output,
+            tile=args.tile, gutter=args.gutter,
+            page_size=args.page_size, page_margin_mm=args.page_margin,
+            pdf_image=args.pdf_image, jpeg_quality=args.jpeg_quality,
+        )
 
         report_path = (workdir / "report.json") if args.dump_report else None
         build_and_print_report(runs, pages, report_path)
