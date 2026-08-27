@@ -6,8 +6,11 @@ work*/
 *.webm
 *.part
 
-# 出力 PDF
+# 出力 PDF と、書き出した譜面画像
 *.pdf
+*.jpg
+*.jpeg
+*.png
 
 # Python
 __pycache__/
