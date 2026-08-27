@@ -168,7 +168,9 @@ python3 extract_sheets.py ./drum_practice.mp4 \
 7. **クロップ & 出力**: 採用された全ページのインク領域の和集合バウンディング
    ボックスに `--margin` 分の余白を足して統一クロップ（`--no-autocrop` で無効
    化可）。`--tile N` 指定時はN段を1枚に積み上げ、`--page-size` 指定時は用紙
-   サイズに収めた上で、`img2pdf` でPDFに組み立てます。
+   サイズに収めた上で、`img2pdf` でPDFに組み立てます。最後のシートは段数が
+   足りなくても他と同じ大きさに揃えられるので、全ページの向きと段の大きさが
+   一致します。埋め込む画像は既定でグレースケールJPEGです（`--pdf-image`）。
 
 なお `--crop` は 2. の直後（各フレームを読み込んだ時点）で適用されるため、
 3.〜7. のすべてが譜面領域だけを見ることになります。
@@ -205,6 +207,8 @@ python3 extract_sheets.py ./drum_practice.mp4 \
 | `--gutter` | `24` | `--tile` 使用時、段と段の間隔（px） |
 | `--page-size` | `none` | `a4` / `letter` を指定すると用紙サイズに収める（`none` は画像そのままのサイズ） |
 | `--page-margin` | `10` | `--page-size` 指定時に確保する余白（mm） |
+| `--pdf-image` | `gray-jpeg` | PDF内の画像形式。`gray-jpeg`=グレースケールJPEG（推奨） / `rgb-lossless`=カラー無劣化（ビューアによっては白紙になる。下記参照） |
+| `--jpeg-quality` | `92` | `--pdf-image gray-jpeg` のときのJPEG品質 |
 | `--dump-report` | `False` | `workdir/report.json` にも解析結果を書き出す |
 | `--debug-frames` | `False` | 重複除去前の各区間の合成画像を `workdir/debug/` に保存 |
 | `--verbose` | `False` | 詳細ログをstderrに出力 |
@@ -254,6 +258,18 @@ python3 extract_sheets.py ./drum_practice.mp4 \
 五線そのものがインクの大半を占めるため差分が出にくくなっているので、
 `--change-threshold` を下げます。逆に帯の上端に映像が混入していると過剰分割に
 なるので、その場合は `--crop` を内側に詰めます。
+
+
+### PDFが白紙で表示される
+
+`--pdf-image rgb-lossless` を指定した場合に起こり得ます。無劣化のRGB画像を
+そのまま埋め込むと1ページあたり展開時10MBを超えることがあり、Googleドライブの
+プレビューや一部のモバイルPDFビューアはこれをエラーも出さず**何も描画しない**
+（＝白紙に見える）ためです。PDFファイル自体は壊れていません。
+
+既定の `gray-jpeg` を使ってください。譜面は白黒なのでグレースケール化による
+情報の損失はなく、展開時サイズが約1/5になり、JPEG(DCTDecode)はPDFで最も広く
+サポートされている画像形式です。
 
 
 ### クロップがおかしい

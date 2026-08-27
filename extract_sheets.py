@@ -759,11 +759,16 @@ def tile_images(
     sheets the way the original printed score would have laid them out.
     """
     background = 0 if invert else 255
+    groups = [images[i : i + per_sheet] for i in range(0, len(images), per_sheet)]
+    width = max(im.shape[1] for im in images)
+    # Size every sheet as if it were full, so a short final sheet still has the
+    # shape of the others. Otherwise the last one comes out wide and squat, and
+    # the PDF gives it a different page orientation and a different scale from
+    # the rest -- a score that changes orientation on the last page.
+    full = groups[0]
+    height = sum(im.shape[0] for im in full) + gutter * (len(full) - 1)
     sheets: List[np.ndarray] = []
-    for start in range(0, len(images), per_sheet):
-        group = images[start : start + per_sheet]
-        width = max(im.shape[1] for im in group)
-        height = sum(im.shape[0] for im in group) + gutter * (len(group) - 1)
+    for group in groups:
         sheet = np.full((height, width, 3), background, dtype=np.uint8)
         y = 0
         for im in group:
@@ -771,6 +776,24 @@ def tile_images(
             y += im.shape[0] + gutter
         sheets.append(sheet)
     return sheets
+
+
+def encode_for_pdf(src: Path, dest: Path, quality: int) -> Path:
+    """Re-encode a page image as a grayscale JPEG for embedding in the PDF.
+
+    The obvious thing is to embed the PNGs directly, which img2pdf does as
+    lossless Flate RGB. That produces a PDF some viewers -- Google Drive's
+    preview and several mobile readers among them -- render as blank pages: a
+    full-page 200dpi RGB raster decodes to over 11MB per page, and rather than
+    fail loudly they draw nothing. Grayscale JPEG cuts that by roughly five
+    times and is the most universally supported image codec in PDF. A score is
+    black on white, so dropping colour costs nothing.
+    """
+    from PIL import Image
+
+    with Image.open(src) as im:
+        im.convert("L").save(dest, format="JPEG", quality=quality, optimize=True)
+    return dest
 
 
 def stage7_crop_and_export(
@@ -784,6 +807,8 @@ def stage7_crop_and_export(
     gutter: int = 24,
     page_size: str = "none",
     page_margin_mm: float = 10.0,
+    pdf_image: str = "gray-jpeg",
+    jpeg_quality: int = 92,
 ) -> List[Path]:
     if not pages:
         raise RuntimeError("no pages survived the pipeline; nothing to export")
@@ -824,6 +849,11 @@ def stage7_crop_and_export(
             pdf_paths.append(sheet_path)
         LOG.info("tiled %d pages into %d sheets (%d per sheet)", len(pages), len(sheets), tile)
 
+    if pdf_image == "gray-jpeg":
+        pdf_paths = [
+            encode_for_pdf(src, src.with_suffix(".jpg"), jpeg_quality) for src in pdf_paths
+        ]
+
     import img2pdf
 
     convert_kwargs = {}
@@ -833,7 +863,9 @@ def stage7_crop_and_export(
             pagesize=(img2pdf.mm_to_pt(width_mm), img2pdf.mm_to_pt(height_mm)),
             border=(img2pdf.mm_to_pt(page_margin_mm), img2pdf.mm_to_pt(page_margin_mm)),
             fit=img2pdf.FitMode.into,
-            auto_orient=True,
+            # An explicit paper size means that orientation. Auto-orient would
+            # turn any sheet that happens to be wider than it is tall sideways.
+            auto_orient=False,
         )
         LOG.info("laying pages out on %s with a %dmm border", page_size, page_margin_mm)
 
@@ -965,6 +997,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--gutter", type=int, default=24, help="vertical gap in px between stacked pages when --tile is used")
     p.add_argument("--page-size", choices=["none", "a4", "letter"], default="none", help="fit each page onto a fixed paper size ('none' keeps the image's own size)")
     p.add_argument("--page-margin", type=float, default=10.0, metavar="MM", help="border in mm left around the image when --page-size is set")
+    p.add_argument("--pdf-image", choices=["gray-jpeg", "rgb-lossless"], default="gray-jpeg", help="how page images are encoded inside the PDF; 'rgb-lossless' keeps colour but produces large rasters some viewers render as blank pages")
+    p.add_argument("--jpeg-quality", type=int, default=92, help="JPEG quality when --pdf-image is gray-jpeg")
 
     p.add_argument("--dump-report", action="store_true", help="write workdir/report.json in addition to the printed table")
     p.add_argument("--debug-frames", action="store_true", help="save each run's pre-dedupe composite image to workdir/debug/")
@@ -1035,6 +1069,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             kept_pages, args.autocrop, args.margin, args.invert, pages_dir, args.output,
             tile=args.tile, gutter=args.gutter,
             page_size=args.page_size, page_margin_mm=args.page_margin,
+            pdf_image=args.pdf_image, jpeg_quality=args.jpeg_quality,
         )
 
         report_path = (workdir / "report.json") if args.dump_report else None
