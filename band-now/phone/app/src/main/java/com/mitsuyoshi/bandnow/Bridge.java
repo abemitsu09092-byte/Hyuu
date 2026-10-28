@@ -87,9 +87,11 @@ final class Bridge {
     /** 今の1つをバンドへ送る */
     void send() {
         if (Store.text(ctx).isEmpty()) { say("まだ送る1つがありません"); return; }
+        Notifier.show(ctx);
+        say("通知に出しました（Mi Fitnessがバンドへ転送します）：" + Store.text(ctx));
         ready(() -> messageApi.sendMessage(nodeId, Store.json(ctx).getBytes(StandardCharsets.UTF_8))
-                .addOnSuccessListener(v -> say("バンドに送りました：" + Store.text(ctx)))
-                .addOnFailureListener(e -> say("送れませんでした（バンドで今やる1つを開くと届きます）：" + e.getMessage())));
+                .addOnSuccessListener(v -> say("バンドのアプリにも送りました"))
+                .addOnFailureListener(e -> { }));
     }
 
     /** バンドの「今やる1つ」アプリを開く */
