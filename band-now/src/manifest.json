@@ -1,25 +1,32 @@
 {
   "package": "com.mitsuyoshi.bandnow",
-  "name": "今やる1つ",
-  "icon": "/common/icon.png",
-  "versionName": "0.1.0",
-  "versionCode": 1,
+  "name": "Ima1",
+  "versionName": "0.1.2",
+  "versionCode": 3,
+  "minPlatformVersion": 1000,
   "minAPILevel": 1,
+  "icon": "/common/icon.png",
+  "deviceTypeList": [
+    "watch"
+  ],
   "features": [
-    { "name": "system.storage" }
+    {
+      "name": "system.router"
+    }
   ],
   "config": {
-    "logLevel": "info",
-    "designWidth": 336
+    "logLevel": "warn",
+    "designWidth": 168
   },
   "router": {
     "entry": "pages/index",
     "pages": {
-      "pages/index": { "component": "index" }
+      "pages/index": {
+        "component": "index"
+      }
     }
   },
   "display": {
     "backgroundColor": "#000000"
-  },
-  "deviceTypeList": ["watch"]
+  }
 }
