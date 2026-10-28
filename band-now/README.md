@@ -1,22 +1,28 @@
 # band-now（今やる1つ）
 
-Xiaomi Smart Band 9 Pro（Vela OS、画面 336×480）に「今やる1つ」を1行だけ出す自作アプリ。
+Xiaomi Smart Band 9 Pro に「今やる1つ」を1行だけ出す仕組み。3つの部品でできている。
 
-## 段階
-1. 【いまここ】「Hello」だけのアプリをバンドに入れる
-2. スマホから文字を送ってバンドの表示を変える（interconnect。9 Pro は公式表に無く実機確認が必要）
-3. Jarvis の締め切り箱とつなぐ
-
-## 作り方（PC・クラウドどちらでも）
 ```
-npm install
-npx aiot build        # dist/com.mitsuyoshi.bandnow.debug.0.1.0.rpk ができる
+Jarvis（PC） ──Tailscale──▶ スマホの中継アプリ ──Mi Fitness経由──▶ バンドのアプリ
+締め切り箱/今やる1つ.md      15分ごと or 手で送る          開くと最新を表示・タップで取り直し
 ```
-署名は `sign/debug/private.pem` と `certificate.pem`（Git には入れない。段階2でスマホ側アプリと同じ鍵が必要になるので無くさない）。
 
-## バンドへの入れ方（公式アプリの開発者メニュー）
-1. スマホの Mi Fitness（小米运动健康）→ プロフィール → 「について / About」を何度も連打
-2. 開発者メニュー（Debug）が出たら「サードパーティアプリ / 第三方应用」→ パッケージ名 `com.mitsuyoshi.bandnow` → rpk ファイルを選ぶ
-3. 出ないとき（グローバル版で隠れている場合）は AstroBox などの有志ツールを検討
+| 部品 | 場所 | 中身 |
+|---|---|---|
+| バンドのアプリ | `src/` | Vela クイックアプリ。受け取った1つを保存して表示。通信できなくても落ちない |
+| スマホの中継アプリ | `phone/` | Android（Java）。手で入力／他アプリの「共有」／Jarvis の URL から取って、バンドへ送る |
+| PCの窓口 | `pc/` | `今やる1つ.md` の1行目を `http://cagent09:8765/now.txt` で返すだけ。Tailscale からのみ |
 
-参考: VoidTerminal-Vela（gitea.com/sisheng-mirror-4/VoidTerminal-Vela）、xiaomi-band-development（github.com/mhdbaselar/xiaomi-band-development）、Vela 公式 https://iot.mi.com/vela/quickapp
+## 作り方
+- バンド: `npm install && npx aiot build` → `dist/*.rpk`
+- スマホ: `phone/app/libs/` に小米の `xms-wearable-lib_1.4_release.aar` を置き（[公式デモ](https://cdn.cnbj3-fusion.fds.api.mi-img.com/quickapp-vela/interconnect_dev_test_demo.zip)に同梱、Git には入れない）、`cd phone && gradle assembleRelease`
+- 署名: `sign/`（Git には入れない）。**バンドとスマホは同じ鍵・同じパッケージ名 `com.mitsuyoshi.bandnow` でないと通信できない**
+
+## 入れ方
+1. バンド: Notify for Xiaomi →「Device」→「Third party app」→ rpk
+2. スマホ: apk をそのまま開いてインストール（提供元不明アプリの許可が要る）。開くと Mi Fitness の許可が出るので許可
+3. PC: `pc/setup-pc.ps1` の中身を PowerShell に貼る
+
+## わかっていない所
+- 9 Pro は小米の公式通信対応表に載っていない。グローバル版 Mi Fitness で通るかは実機で確認するしかない
+- スマホのアプリは常駐しないので、バンドから「取り直し」を押しても、スマホ側がしばらく寝ていると返事が無いことがある（15分ごとの自動取得のときは起きている）

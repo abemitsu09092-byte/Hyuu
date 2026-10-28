@@ -3,3 +3,8 @@ build
 dist
 sign
 .temp_*
+phone/.gradle
+phone/build
+phone/app/build
+phone/app/libs
+phone/local.properties

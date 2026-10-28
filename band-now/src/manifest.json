@@ -1,18 +1,16 @@
 {
   "package": "com.mitsuyoshi.bandnow",
   "name": "Ima1",
-  "versionName": "0.1.2",
-  "versionCode": 3,
+  "versionName": "0.2.0",
+  "versionCode": 10,
   "minPlatformVersion": 1000,
   "minAPILevel": 1,
   "icon": "/common/icon.png",
-  "deviceTypeList": [
-    "watch"
-  ],
+  "deviceTypeList": ["watch"],
   "features": [
-    {
-      "name": "system.router"
-    }
+    { "name": "system.router" },
+    { "name": "system.storage" },
+    { "name": "system.interconnect" }
   ],
   "config": {
     "logLevel": "warn",
@@ -21,9 +19,7 @@
   "router": {
     "entry": "pages/index",
     "pages": {
-      "pages/index": {
-        "component": "index"
-      }
+      "pages/index": { "component": "index" }
     }
   },
   "display": {

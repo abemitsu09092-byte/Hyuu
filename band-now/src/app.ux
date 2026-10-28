@@ -1,7 +1,3 @@
 <script>
-export default {
-  onCreate() {
-    console.log('[app] onCreate')
-  }
-}
+export default {}
 </script>

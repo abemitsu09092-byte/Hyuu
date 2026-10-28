@@ -1,0 +1,49 @@
+plugins {
+    id 'com.android.application'
+}
+
+// 署名はバンドのアプリ（rpk）と同じ鍵でないと、小米の通信がこっそり失敗する
+def keystoreProps = new Properties()
+def keystoreFile = rootProject.file('../sign/keystore.properties')
+if (keystoreFile.exists()) keystoreFile.withInputStream { keystoreProps.load(it) }
+
+android {
+    namespace 'com.mitsuyoshi.bandnow'
+    compileSdk 34
+
+    defaultConfig {
+        // バンドのアプリの package と同じでないといけない
+        applicationId 'com.mitsuyoshi.bandnow'
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName '0.2.0'
+    }
+
+    signingConfigs {
+        bandnow {
+            storeFile rootProject.file('../sign/bandnow.jks')
+            storePassword keystoreProps['storePassword']
+            keyAlias keystoreProps['keyAlias']
+            keyPassword keystoreProps['keyPassword']
+        }
+    }
+
+    buildTypes {
+        debug { signingConfig signingConfigs.bandnow }
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.bandnow
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+dependencies {
+    implementation fileTree(dir: 'libs', include: ['*.aar'])
+    implementation 'androidx.annotation:annotation:1.7.1'
+}

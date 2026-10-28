@@ -1,13 +1,91 @@
 <template>
-  <div class="page">
+  <div class="page" onclick="refresh">
+    <text class="label">今やる1つ</text>
     <text class="task">{{ task }}</text>
+    <text class="foot">{{ foot }}</text>
   </div>
 </template>
 
 <script>
+import storage from '@system.storage'
+
+// スマホとの通信。9 Pro は公式の対応表に無いので、使えなくても落ちないように全部 try で包む
+let conn = null
+
+function openConn() {
+  if (conn) return conn
+  try {
+    const mod = require('@system.interconnect')
+    conn = mod ? mod.instance() : null
+  } catch (e) {
+    conn = null
+  }
+  return conn
+}
+
 export default {
   private: {
-    task: '今やる1つ'
+    task: 'まだ届いていません',
+    foot: 'v0.2.0',
+    at: ''
+  },
+
+  onInit() {
+    storage.get({
+      key: 'now',
+      success: (raw) => {
+        if (!raw) return
+        try {
+          const saved = JSON.parse(raw)
+          this.task = saved.text || this.task
+          this.at = saved.at || ''
+          this.foot = this.at ? this.at + ' 更新' : this.foot
+        } catch (e) {}
+      }
+    })
+  },
+
+  onShow() {
+    const c = openConn()
+    if (!c) {
+      this.foot = 'スマホとつながりません'
+      return
+    }
+    c.onmessage = (res) => this.receive(res && res.data)
+    c.onopen = () => this.ask()
+    this.ask()
+  },
+
+  receive(raw) {
+    if (!raw) return
+    let msg = null
+    try {
+      msg = typeof raw === 'string' ? JSON.parse(raw) : raw
+    } catch (e) {
+      msg = { text: String(raw) }
+    }
+    if (!msg || !msg.text) return
+    this.task = msg.text
+    this.at = msg.at || ''
+    this.foot = this.at ? this.at + ' 更新' : '更新しました'
+    storage.set({ key: 'now', value: JSON.stringify({ text: this.task, at: this.at }) })
+  },
+
+  // スマホに「今の1つをちょうだい」と頼む
+  ask() {
+    const c = openConn()
+    if (!c) return
+    try {
+      c.send({
+        data: { t: 'get' },
+        fail: () => { this.foot = 'スマホのアプリを開いてください' }
+      })
+    } catch (e) {}
+  },
+
+  refresh() {
+    this.foot = '取りに行っています…'
+    this.ask()
   }
 }
 </script>
@@ -21,8 +99,20 @@ export default {
   align-items: center;
   background-color: #000000;
 }
+.label {
+  font-size: 13px;
+  color: #8ab4f8;
+  margin-bottom: 12px;
+}
 .task {
-  font-size: 24px;
+  width: 150px;
+  font-size: 22px;
   color: #ffffff;
+  text-align: center;
+}
+.foot {
+  font-size: 10px;
+  color: #777777;
+  margin-top: 16px;
 }
 </style>
