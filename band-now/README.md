@@ -14,7 +14,7 @@ Jarvis（PC） ──Tailscale──▶ スマホの中継アプリ ──Mi Fit
 | PCの窓口 | `pc/` | `今やる1つ.md` の1行目を `http://cagent09:8765/now.txt` で返すだけ。Tailscale からのみ |
 
 ## 作り方
-- バンド: `npm install && npx aiot build` → `dist/*.rpk`
+- バンド: `npm install && npx aiot release` → `dist/*.release.*.rpk`（**debug 版は実機で開くとバンドごと再起動した**ので必ず release）
 - スマホ: `phone/app/libs/` に小米の `xms-wearable-lib_1.4_release.aar` を置き（[公式デモ](https://cdn.cnbj3-fusion.fds.api.mi-img.com/quickapp-vela/interconnect_dev_test_demo.zip)に同梱、Git には入れない）、`cd phone && gradle assembleRelease`
 - 署名: `sign/`（Git には入れない）。**バンドとスマホは同じ鍵・同じパッケージ名 `com.mitsuyoshi.bandnow` でないと通信できない**
 

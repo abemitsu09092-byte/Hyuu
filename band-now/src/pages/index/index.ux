@@ -26,7 +26,7 @@ function openConn() {
 export default {
   private: {
     task: 'まだ届いていません',
-    foot: 'v0.2.0',
+    foot: 'v0.2.1',
     at: ''
   },
 
